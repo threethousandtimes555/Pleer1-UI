@@ -9,6 +9,7 @@ struct Track: Codable, Identifiable, Hashable {
     var file: String? = nil
     var archive: String? = nil
     var added: Double = 0
+    var artFile: String? = nil
 
     var isLocal: Bool { return file != nil }
 
@@ -23,6 +24,12 @@ struct Track: Codable, Identifiable, Hashable {
         default: return ""
         }
     }
+}
+
+struct FileMeta: Codable {
+    var title: String? = nil
+    var artist: String? = nil
+    var art: String? = nil
 }
 
 struct Playlist: Codable, Identifiable {

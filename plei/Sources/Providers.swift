@@ -6,12 +6,18 @@ enum Sources {
         return s.addingPercentEncoding(withAllowedCharacters: ok) ?? s
     }
 
-    static func json(_ s: String) async throws -> Any {
+    static func json(_ s: String, timeout: Double = 10) async throws -> Any {
         guard let u = URL(string: s) else { throw URLError(.badURL) }
         var r = URLRequest(url: u)
-        r.timeoutInterval = 10
+        r.timeoutInterval = timeout
+        r.setValue("application/json", forHTTPHeaderField: "Accept")
+        r.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Plei/0.1", forHTTPHeaderField: "User-Agent")
         let (d, _) = try await URLSession.shared.data(for: r)
-        return try JSONSerialization.jsonObject(with: d)
+        do {
+            return try JSONSerialization.jsonObject(with: d)
+        } catch {
+            throw NSError(domain: "json", code: 2, userInfo: [NSLocalizedDescriptionKey: "сервер ответил не данными (возможно, закрыт для приложений)"])
+        }
     }
 
     static func s(_ v: Any?) -> String? {
@@ -36,7 +42,7 @@ enum Sources {
 
     // MARK: Jamendo
     static func jamendo(_ q: String, key: String) async throws -> [Track] {
-        let j = try await json("https://api.jamendo.com/v3.0/tracks/?format=json&limit=25&audioformat=mp32&imagesize=500&client_id=\(enc(key))&search=\(enc(q))")
+        let j = try await json("https://api.jamendo.com/v3.0/tracks/?format=json&limit=25&audioformat=mp32&imagesize=600&client_id=\(enc(key))&search=\(enc(q))")
         guard let o = j as? [String: Any], let rs = o["results"] as? [[String: Any]] else {
             throw NSError(domain: "Jamendo", code: 1, userInfo: [NSLocalizedDescriptionKey: "ответ без результатов, проверь ключ"])
         }
@@ -54,7 +60,7 @@ enum Sources {
             guard let id = s(r["id"]), let title = s(r["title"]) else { return nil }
             if let st = r["is_streamable"] as? Bool, !st { return nil }
             let user = (r["user"] as? [String: Any]).flatMap { s($0["name"]) } ?? ""
-            let art = (r["artwork"] as? [String: Any]).flatMap { s($0["480x480"]) ?? s($0["150x150"]) }
+            let art = (r["artwork"] as? [String: Any]).flatMap { s($0["1000x1000"]) ?? s($0["480x480"]) ?? s($0["150x150"]) }
             return Track(id: "d" + id, title: title, artist: user, art: art,
                          url: "https://discoveryprovider.audius.co/v1/tracks/\(id)/stream?app_name=Plei")
         }
@@ -63,7 +69,7 @@ enum Sources {
     // MARK: Internet Archive
     static func archive(_ q: String) async throws -> [Track] {
         let query = enc("(\(q)) AND mediatype:audio")
-        let j = try await json("https://archive.org/advancedsearch.php?output=json&rows=15&fl%5B%5D=identifier&fl%5B%5D=title&fl%5B%5D=creator&q=\(query)")
+        let j = try await json("https://archive.org/advancedsearch.php?output=json&rows=15&fl%5B%5D=identifier&fl%5B%5D=title&fl%5B%5D=creator&sort%5B%5D=downloads+desc&q=\(query)", timeout: 25)
         let docs = ((j as? [String: Any])?["response"] as? [String: Any])?["docs"] as? [[String: Any]] ?? []
         return docs.compactMap { d in
             guard let id = s(d["identifier"]) else { return nil }
@@ -88,19 +94,41 @@ enum Sources {
 
     // MARK: ccMixter
     static func ccmixter(_ q: String) async throws -> [Track] {
-        let j = try await json("https://ccmixter.org/api/query?f=json&limit=25&search_type=all&search=\(enc(q))")
+        let path = "ccmixter.org/api/query?f=json&limit=25&search_type=all&search=\(enc(q))"
+        var j: Any
+        do {
+            j = try await json("https://" + path)
+        } catch {
+            j = try await json("http://" + path)
+        }
         let arr = j as? [[String: Any]] ?? []
         return arr.compactMap { r in
             guard let id = s(r["upload_id"]), let name = s(r["upload_name"]) else { return nil }
             let files = r["files"] as? [[String: Any]] ?? []
             let urls = files.compactMap { s($0["download_url"]) }
             guard let u = urls.first(where: { $0.lowercased().hasSuffix(".mp3") }) else { return nil }
-            return Track(id: "c" + id, title: name, artist: s(r["user_name"]) ?? "ccMixter", url: u)
+            let fixed = (u.hasPrefix("https://") && u.contains("ccmixter.org")) ? "http://" + String(u.dropFirst(8)) : u
+            return Track(id: "c" + id, title: name, artist: s(r["user_name"]) ?? "ccMixter", url: fixed)
         }
     }
 
     // MARK: Funkwhale
     static func funkwhale(_ q: String, host: String) async throws -> [Track] {
+        let hosts = host.split(whereSeparator: { $0 == "," || $0 == " " }).map { String($0) }
+        var lastError: Error? = nil
+        for h in hosts {
+            do {
+                let r = try await funkwhaleOne(q, host: h)
+                if !r.isEmpty { return r }
+            } catch {
+                lastError = error
+            }
+        }
+        if let e = lastError { throw e }
+        return []
+    }
+
+    static func funkwhaleOne(_ q: String, host: String) async throws -> [Track] {
         let h = host.replacingOccurrences(of: "https://", with: "").trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
         if h.isEmpty { return [] }
         let j = try await json("https://\(h)/api/v1/tracks/?q=\(enc(q))&playable=true&page_size=25")
@@ -112,7 +140,8 @@ enum Sources {
                 listen = ups.compactMap { s($0["listen_url"]) }.first
             }
             guard let l = listen else { return nil }
-            let url = l.hasPrefix("http") ? l : "https://\(h)\(l)"
+            let full = l.hasPrefix("http") ? l : "https://\(h)\(l)"
+            let url = full + (full.contains("?") ? "&" : "?") + "to=mp3"
             let artist = (r["artist"] as? [String: Any]).flatMap { s($0["name"]) } ?? ""
             var art: String? = nil
             if let cover = (r["album"] as? [String: Any])?["cover"] as? [String: Any],

@@ -32,13 +32,18 @@ enum RepeatMode: String {
     }
 }
 
+/// Часто меняющиеся значения вынесены отдельно, чтобы не перерисовывать списки
+@MainActor
+final class Clock: ObservableObject {
+    @Published var position: Double = 0
+    @Published var duration: Double = 0
+}
+
 @MainActor
 final class Player: ObservableObject {
     @Published var queue: [Track] = []
     @Published var index: Int = 0
     @Published var isPlaying = false
-    @Published var position: Double = 0
-    @Published var duration: Double = 0
     @Published var sleepMinutes = 0
     @Published var repeatMode: RepeatMode = RepeatMode(rawValue: UserDefaults.standard.string(forKey: "rm") ?? "off") ?? .off
     @Published var speed: Double = {
@@ -46,6 +51,7 @@ final class Player: ObservableObject {
         return v == 0 ? 1.0 : v
     }()
 
+    let clock = Clock()
     weak var store: Store?
 
     var current: Track? {
@@ -55,12 +61,16 @@ final class Player: ObservableObject {
     private let player = AVPlayer()
     private var timeObs: Any?
     private var endObs: NSObjectProtocol?
+    private var statusObs: NSKeyValueObservation?
     private var sleepTask: Task<Void, Never>?
+    private var loadToken = 0
+    private var plannedNext: Int? = nil
 
     init() {
         let session = AVAudioSession.sharedInstance()
         try? session.setCategory(.playback, mode: .default)
         try? session.setActive(true)
+        player.automaticallyWaitsToMinimizeStalling = true
 
         timeObs = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main) { [weak self] t in
             Task { @MainActor in self?.tick(t) }
@@ -76,9 +86,10 @@ final class Player: ObservableObject {
             }
         }
         setupRemote()
+        Task.detached { AudioCache.shared.trim() }
     }
 
-    // MARK: playback
+    // MARK: queue
     func play(_ list: [Track], at i: Int = 0) {
         if list.isEmpty { return }
         queue = list
@@ -93,35 +104,109 @@ final class Player: ObservableObject {
         }
     }
 
-    private func playURL(_ t: Track) -> URL? {
-        if let f = t.file { return Store.musicDir.appendingPathComponent(f) }
-        if let u = t.url { return URL(string: u) }
-        return nil
+    private func planNext() {
+        if queue.count < 2 {
+            plannedNext = repeatMode == .off ? nil : (queue.isEmpty ? nil : index)
+            return
+        }
+        switch repeatMode {
+        case .shuffle:
+            var j = index
+            while j == index { j = Int.random(in: 0..<queue.count) }
+            plannedNext = j
+        case .one:
+            plannedNext = index
+        case .all:
+            plannedNext = index < queue.count - 1 ? index + 1 : 0
+        case .off:
+            plannedNext = index < queue.count - 1 ? index + 1 : nil
+        }
+    }
+
+    // MARK: loading
+    private func localURL(_ t: Track) -> URL? {
+        if let f = t.file { return Paths.music.appendingPathComponent(f) }
+        return AudioCache.shared.lookup(t)
     }
 
     private func load() {
         guard let t = current else { return }
+        loadToken += 1
+        planNext()
         if t.archive != nil {
             Task { await expandArchive(t) }
             return
         }
-        guard let url = playURL(t) else {
+        clock.position = 0
+        clock.duration = 0
+        isPlaying = true
+        store?.addHistory(t)
+        if let url = localURL(t) {
+            start(url, t, streaming: false)
+        } else if let s = t.url, let u = URL(string: s) {
+            start(u, t, streaming: true)
+        } else {
             store?.say("Файл не найден")
-            return
         }
-        let item = AVPlayerItem(url: url)
+        updateNowPlaying()
+    }
+
+    private func start(_ url: URL, _ t: Track, streaming: Bool) {
+        let asset: AVURLAsset
+        if url.isFileURL {
+            asset = AVURLAsset(url: url)
+        } else {
+            asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": ["User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Plei/0.2"]])
+        }
+        let item = AVPlayerItem(asset: asset)
         if let o = endObs { NotificationCenter.default.removeObserver(o) }
         endObs = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.advance(auto: true) }
         }
+        let token = loadToken
+        statusObs = item.observe(\.status, options: [.new]) { [weak self] it, _ in
+            let st = it.status
+            let msg = it.error?.localizedDescription ?? ""
+            Task { @MainActor in self?.itemStatus(st, msg, t, token, streaming) }
+        }
         player.replaceCurrentItem(with: item)
         player.play()
         player.rate = Float(speed)
-        position = 0
-        duration = 0
-        isPlaying = true
-        store?.addHistory(t)
-        updateNowPlaying()
+    }
+
+    private func itemStatus(_ st: AVPlayerItem.Status, _ msg: String, _ t: Track, _ token: Int, _ streaming: Bool) {
+        if token != loadToken { return }
+        if st == .readyToPlay {
+            updateNowPlaying()
+            prefetchNext()
+        } else if st == .failed {
+            if streaming {
+                Task { await recover(t, token) }
+            } else {
+                store?.say("Не воспроизводится: " + msg)
+            }
+        }
+    }
+
+    /// Если поток не открылся, скачиваем трек целиком и играем из файла
+    private func recover(_ t: Track, _ token: Int) async {
+        store?.say("Докачиваю трек целиком…")
+        do {
+            let u = try await AudioCache.shared.download(t)
+            if token == loadToken { start(u, t, streaming: false) }
+        } catch {
+            if token == loadToken { store?.say("Не получилось: " + error.localizedDescription) }
+        }
+    }
+
+    /// Следующий трек подгружается заранее, чтобы переключение не лагало
+    private func prefetchNext() {
+        guard let n = plannedNext, queue.indices.contains(n) else { return }
+        let t = queue[n]
+        if t.file != nil || t.archive != nil || t.url == nil { return }
+        Task.detached(priority: .utility) {
+            _ = try? await AudioCache.shared.download(t)
+        }
     }
 
     private func expandArchive(_ t: Track) async {
@@ -137,15 +222,18 @@ final class Player: ObservableObject {
         load()
     }
 
+    // MARK: controls
     func resume() {
         player.play()
         player.rate = Float(speed)
         isPlaying = true
+        updateProgress()
     }
 
     func pause() {
         player.pause()
         isPlaying = false
+        updateProgress()
     }
 
     func toggle() {
@@ -154,22 +242,13 @@ final class Player: ObservableObject {
 
     func advance(auto: Bool = false) {
         if queue.isEmpty { return }
-        if repeatMode == .one && auto {
-            load()
-            return
+        var j: Int? = nil
+        if auto || repeatMode != .one { j = plannedNext }
+        if j == nil {
+            if index < queue.count - 1 { j = index + 1 } else if repeatMode != .off { j = 0 }
         }
-        if repeatMode == .shuffle && queue.count > 1 {
-            var j = index
-            while j == index { j = Int.random(in: 0..<queue.count) }
-            index = j
-            load()
-            return
-        }
-        if index < queue.count - 1 {
-            index += 1
-            load()
-        } else if repeatMode == .all || repeatMode == .one {
-            index = 0
+        if let n = j {
+            index = n
             load()
         } else if auto {
             isPlaying = false
@@ -177,7 +256,7 @@ final class Player: ObservableObject {
     }
 
     func previous() {
-        if position > 3 {
+        if clock.position > 3 {
             seek(0)
         } else if index > 0 {
             index -= 1
@@ -189,12 +268,14 @@ final class Player: ObservableObject {
 
     func seek(_ s: Double) {
         player.seek(to: CMTime(seconds: s, preferredTimescale: 600))
-        position = s
+        clock.position = s
+        updateProgress()
     }
 
     func cycleRepeat() {
         repeatMode = repeatMode.next
         UserDefaults.standard.set(repeatMode.rawValue, forKey: "rm")
+        planNext()
         store?.say(repeatMode.label)
     }
 
@@ -202,6 +283,7 @@ final class Player: ObservableObject {
         speed = v
         UserDefaults.standard.set(v, forKey: "sp")
         if player.timeControlStatus != .paused { player.rate = Float(v) }
+        updateProgress()
     }
 
     func setSleep(_ m: Int) {
@@ -219,39 +301,50 @@ final class Player: ObservableObject {
 
     private func tick(_ t: CMTime) {
         let s = t.seconds
-        position = s.isFinite ? s : 0
-        if let d = player.currentItem?.duration.seconds, d.isFinite, d > 0 { duration = d }
-        isPlaying = player.timeControlStatus != .paused
-        updateProgress()
+        clock.position = s.isFinite ? s : 0
+        if let d = player.currentItem?.duration.seconds, d.isFinite, d > 0, abs(d - clock.duration) > 0.5 {
+            clock.duration = d
+            updateProgress()
+        }
+        let playing = player.timeControlStatus != .paused
+        if playing != isPlaying {
+            isPlaying = playing
+            updateProgress()
+        }
     }
 
     // MARK: lock screen
     private func updateNowPlaying() {
         guard let t = current else { return }
-        var info: [String: Any] = [
+        let info: [String: Any] = [
             MPMediaItemPropertyTitle: t.title,
             MPMediaItemPropertyArtist: t.artist,
-            MPNowPlayingInfoPropertyPlaybackRate: 1.0,
-            MPNowPlayingInfoPropertyElapsedPlaybackTime: 0.0
+            MPMediaItemPropertyPlaybackDuration: clock.duration,
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: clock.position,
+            MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? speed : 0.0
         ]
-        info[MPMediaItemPropertyPlaybackDuration] = 0.0
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
-        if let a = t.art, let u = URL(string: a) {
-            Task {
-                if let r = try? await URLSession.shared.data(from: u), let img = UIImage(data: r.0) {
-                    let art = MPMediaItemArtwork(boundsSize: img.size) { _ in img }
-                    var cur = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
-                    cur[MPMediaItemPropertyArtwork] = art
-                    MPNowPlayingInfoCenter.default().nowPlayingInfo = cur
-                }
+        let id = t.id
+        Task {
+            var img: UIImage? = nil
+            if let f = t.artFile {
+                img = ImageStore.shared.local(f)
+            } else if let a = t.art {
+                img = await ImageStore.shared.image(url: a)
+            }
+            if let image = img, self.current?.id == id {
+                let art = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+                var cur = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
+                cur[MPMediaItemPropertyArtwork] = art
+                MPNowPlayingInfoCenter.default().nowPlayingInfo = cur
             }
         }
     }
 
     private func updateProgress() {
         var cur = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
-        cur[MPMediaItemPropertyPlaybackDuration] = duration
-        cur[MPNowPlayingInfoPropertyElapsedPlaybackTime] = position
+        cur[MPMediaItemPropertyPlaybackDuration] = clock.duration
+        cur[MPNowPlayingInfoPropertyElapsedPlaybackTime] = clock.position
         cur[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? speed : 0.0
         MPNowPlayingInfoCenter.default().nowPlayingInfo = cur
     }

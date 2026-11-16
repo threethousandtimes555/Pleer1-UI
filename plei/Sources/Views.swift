@@ -38,30 +38,6 @@ struct RootView: View {
     }
 }
 
-struct Cover: View {
-    let url: String?
-    let size: CGFloat
-
-    var body: some View {
-        Group {
-            if let u = url, let uu = URL(string: u) {
-                AsyncImage(url: uu) { img in
-                    img.resizable().scaledToFill()
-                } placeholder: {
-                    Color.gray.opacity(0.2)
-                }
-            } else {
-                ZStack {
-                    Color.gray.opacity(0.2)
-                    Image(systemName: "music.note").foregroundColor(.secondary)
-                }
-            }
-        }
-        .frame(width: size, height: size)
-        .clipShape(RoundedRectangle(cornerRadius: size * 0.22))
-    }
-}
-
 struct MiniPlayer: View {
     @EnvironmentObject var player: Player
     @Binding var show: Bool
@@ -69,7 +45,7 @@ struct MiniPlayer: View {
     var body: some View {
         if let t = player.current {
             HStack(spacing: 12) {
-                Cover(url: t.art, size: 44)
+                Cover(track: t, size: 44)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(t.title).lineLimit(1).font(.subheadline.weight(.medium))
                     Text(t.artist).lineLimit(1).font(.caption).foregroundColor(.secondary)
@@ -114,9 +90,9 @@ struct TrackRow: View {
                 player.play(list, at: list.firstIndex(of: track) ?? 0)
             } label: {
                 HStack(spacing: 12) {
-                    Cover(url: track.art, size: 52)
+                    Cover(track: track, size: 56)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(track.title).lineLimit(1)
+                        Text(track.title).lineLimit(2)
                         Text(track.artist + (track.tag.isEmpty ? "" : " · " + track.tag))
                             .font(.footnote)
                             .foregroundColor(.secondary)
@@ -412,96 +388,135 @@ struct SettingsView: View {
     }
 }
 
+struct SeekBar: View {
+    @EnvironmentObject var clock: Clock
+    @EnvironmentObject var player: Player
+    @State private var seeking = false
+    @State private var value = 0.0
+
+    var body: some View {
+        VStack(spacing: 2) {
+            Slider(
+                value: Binding(get: { seeking ? value : clock.position }, set: { value = $0 }),
+                in: 0...max(clock.duration, 1),
+                onEditingChanged: { e in
+                    if e { value = clock.position }
+                    seeking = e
+                    if !e { player.seek(value) }
+                }
+            )
+            HStack {
+                Text(fmt(seeking ? value : clock.position))
+                Spacer()
+                Text(fmt(clock.duration))
+            }
+            .font(.caption)
+            .foregroundColor(.secondary)
+        }
+    }
+}
+
+struct PlayerBackdrop: View {
+    let track: Track?
+
+    var body: some View {
+        ZStack {
+            Color.black
+            ArtView(track: track)
+                .scaleEffect(1.5)
+                .blur(radius: 60)
+                .opacity(0.5)
+            LinearGradient(colors: [Color.black.opacity(0.1), Color.black.opacity(0.75)], startPoint: .top, endPoint: .bottom)
+        }
+        .ignoresSafeArea()
+    }
+}
+
 struct PlayerView: View {
     @EnvironmentObject var player: Player
     @EnvironmentObject var store: Store
-    @State private var seeking = false
-    @State private var seekValue = 0.0
     @State private var showQueue = false
 
     var body: some View {
-        VStack(spacing: 18) {
-            if let t = player.current {
-                Cover(url: t.art, size: 300).padding(.top, 28)
-                HStack {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(t.title).font(.title3.weight(.semibold)).lineLimit(2)
-                        Text(t.artist).foregroundColor(.secondary).lineLimit(1)
-                    }
-                    Spacer()
-                    if !t.isLocal {
-                        Button { store.toggleFav(t) } label: {
-                            Image(systemName: store.isFav(t) ? "heart.fill" : "heart").font(.title2).foregroundColor(accent)
+        GeometryReader { geo in
+            let side = min(geo.size.width - 40, geo.size.height * 0.52)
+            ZStack {
+                PlayerBackdrop(track: player.current)
+                if let t = player.current {
+                    VStack(spacing: 14) {
+                        Spacer(minLength: 6)
+                        ArtView(track: t)
+                            .frame(width: side, height: side)
+                            .clipShape(RoundedRectangle(cornerRadius: 26))
+                            .shadow(color: Color.black.opacity(0.4), radius: 20, x: 0, y: 10)
+                        Spacer(minLength: 4)
+                        HStack {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(t.title).font(.title3.weight(.semibold)).lineLimit(2)
+                                Text(t.artist).foregroundColor(.secondary).lineLimit(1)
+                            }
+                            Spacer()
+                            if !t.isLocal {
+                                Button { store.toggleFav(t) } label: {
+                                    Image(systemName: store.isFav(t) ? "heart.fill" : "heart")
+                                        .font(.title2)
+                                        .foregroundColor(accent)
+                                }
+                            }
                         }
+                        SeekBar()
+                        HStack(spacing: 26) {
+                            Button { player.cycleRepeat() } label: {
+                                Image(systemName: player.repeatMode.icon)
+                                    .foregroundColor(player.repeatMode == .off ? .secondary : accent)
+                            }
+                            Button { player.previous() } label: { Image(systemName: "backward.fill").font(.title) }
+                            Button { player.toggle() } label: {
+                                Image(systemName: player.isPlaying ? "pause.circle.fill" : "play.circle.fill").font(.system(size: 66))
+                            }
+                            Button { player.advance() } label: { Image(systemName: "forward.fill").font(.title) }
+                            Button { showQueue = true } label: { Image(systemName: "list.bullet") }
+                        }
+                        .font(.title2)
+                        .foregroundColor(.primary)
+                        HStack(spacing: 38) {
+                            Menu {
+                                ForEach(store.playlists) { p in
+                                    Button(p.name) { store.add(t, to: p.id) }
+                                }
+                            } label: {
+                                Image(systemName: "text.badge.plus")
+                            }
+                            Menu {
+                                Picker("Таймер сна", selection: Binding(get: { player.sleepMinutes }, set: { player.setSleep($0) })) {
+                                    Text("Выкл").tag(0)
+                                    Text("15 минут").tag(15)
+                                    Text("30 минут").tag(30)
+                                    Text("60 минут").tag(60)
+                                }
+                            } label: {
+                                Image(systemName: "moon.zzz").foregroundColor(player.sleepMinutes > 0 ? accent : .secondary)
+                            }
+                            Menu {
+                                Picker("Скорость", selection: Binding(get: { player.speed }, set: { player.setSpeed($0) })) {
+                                    Text("0.75×").tag(0.75)
+                                    Text("1×").tag(1.0)
+                                    Text("1.25×").tag(1.25)
+                                    Text("1.5×").tag(1.5)
+                                }
+                            } label: {
+                                Image(systemName: "speedometer").foregroundColor(player.speed != 1.0 ? accent : .secondary)
+                            }
+                        }
+                        .font(.title3)
+                        Spacer(minLength: 6)
                     }
+                    .padding(.horizontal, 20)
+                } else {
+                    Text("Ничего не играет").foregroundColor(.secondary)
                 }
-                VStack(spacing: 2) {
-                    Slider(
-                        value: Binding(get: { seeking ? seekValue : player.position }, set: { seekValue = $0 }),
-                        in: 0...max(player.duration, 1),
-                        onEditingChanged: { e in
-                            seeking = e
-                            if !e { player.seek(seekValue) }
-                        }
-                    )
-                    HStack {
-                        Text(fmt(seeking ? seekValue : player.position))
-                        Spacer()
-                        Text(fmt(player.duration))
-                    }
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                }
-                HStack(spacing: 26) {
-                    Button { player.cycleRepeat() } label: {
-                        Image(systemName: player.repeatMode.icon)
-                            .foregroundColor(player.repeatMode == .off ? .secondary : accent)
-                    }
-                    Button { player.previous() } label: { Image(systemName: "backward.fill").font(.title) }
-                    Button { player.toggle() } label: {
-                        Image(systemName: player.isPlaying ? "pause.circle.fill" : "play.circle.fill").font(.system(size: 66))
-                    }
-                    Button { player.advance() } label: { Image(systemName: "forward.fill").font(.title) }
-                    Button { showQueue = true } label: { Image(systemName: "list.bullet") }
-                }
-                .font(.title2)
-                .foregroundColor(.primary)
-                HStack(spacing: 38) {
-                    Menu {
-                        ForEach(store.playlists) { p in
-                            Button(p.name) { store.add(t, to: p.id) }
-                        }
-                    } label: {
-                        Image(systemName: "text.badge.plus")
-                    }
-                    Menu {
-                        Picker("Таймер сна", selection: Binding(get: { player.sleepMinutes }, set: { player.setSleep($0) })) {
-                            Text("Выкл").tag(0)
-                            Text("15 минут").tag(15)
-                            Text("30 минут").tag(30)
-                            Text("60 минут").tag(60)
-                        }
-                    } label: {
-                        Image(systemName: "moon.zzz").foregroundColor(player.sleepMinutes > 0 ? accent : .secondary)
-                    }
-                    Menu {
-                        Picker("Скорость", selection: Binding(get: { player.speed }, set: { player.setSpeed($0) })) {
-                            Text("0.75×").tag(0.75)
-                            Text("1×").tag(1.0)
-                            Text("1.25×").tag(1.25)
-                            Text("1.5×").tag(1.5)
-                        }
-                    } label: {
-                        Image(systemName: "speedometer").foregroundColor(player.speed != 1.0 ? accent : .secondary)
-                    }
-                }
-                .font(.title3)
-                Spacer()
-            } else {
-                Text("Ничего не играет").foregroundColor(.secondary)
             }
         }
-        .padding(.horizontal, 24)
         .presentationDragIndicator(.visible)
         .sheet(isPresented: $showQueue) {
             QueueView().environmentObject(player)
@@ -518,7 +533,7 @@ struct QueueView: View {
                 ForEach(Array(player.queue.enumerated()), id: \.offset) { i, t in
                     Button { player.jump(to: i) } label: {
                         HStack(spacing: 12) {
-                            Cover(url: t.art, size: 44)
+                            Cover(track: t, size: 44)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(t.title).lineLimit(1)
                                 Text(t.artist).font(.footnote).foregroundColor(.secondary).lineLimit(1)
