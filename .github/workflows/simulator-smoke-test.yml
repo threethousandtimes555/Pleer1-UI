@@ -1,0 +1,87 @@
+name: Pleer1 Simulator Smoke Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  simulator-smoke-test:
+    name: Build and launch public Pleer1 in iOS Simulator
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout public repository
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen --version
+
+      - name: Generate Xcode project
+        working-directory: plei
+        run: xcodegen generate
+
+      - name: Build for iOS Simulator (no IPA, no signing)
+        working-directory: plei
+        shell: bash
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project Plei.xcodeproj \
+            -scheme Plei \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build 2>&1 | tee "$RUNNER_TEMP/pleer1-simulator-build.log"
+
+      - name: Boot simulator and launch app
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DEVICE_ID="$(xcrun simctl list devices available --json | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          devices = [d for group in data["devices"].values() for d in group]
+          device = next((d for d in devices if "iPhone" in d["name"] and d["isAvailable"]), None)
+          print(device["udid"] if device else "")
+          ')"
+
+          if [[ -z "$DEVICE_ID" ]]; then
+            echo "::error::No available iPhone simulator found"
+            xcrun simctl list devices available
+            exit 1
+          fi
+
+          echo "Selected simulator: $DEVICE_ID"
+          xcrun simctl boot "$DEVICE_ID" || true
+          xcrun simctl bootstatus "$DEVICE_ID" -b
+
+          APP_PATH="$GITHUB_WORKSPACE/plei/build/Build/Products/Debug-iphonesimulator/Plei.app"
+          test -d "$APP_PATH"
+
+          xcrun simctl install "$DEVICE_ID" "$APP_PATH"
+          xcrun simctl launch "$DEVICE_ID" com.mylocal.plei
+          sleep 3
+          xcrun simctl io "$DEVICE_ID" screenshot "$RUNNER_TEMP/pleer1-simulator.png"
+
+          echo "SIMULATOR_LAUNCH=SUCCESS"
+
+      - name: Upload simulator screenshot and build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pleer1-public-simulator-smoke-test
+          path: |
+            ${{ runner.temp }}/pleer1-simulator.png
+            ${{ runner.temp }}/pleer1-simulator-build.log
+          if-no-files-found: warn
+          retention-days: 1
