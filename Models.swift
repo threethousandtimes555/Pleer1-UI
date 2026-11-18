@@ -38,6 +38,18 @@ struct Playlist: Codable, Identifiable {
     var tracks: [Track] = []
 }
 
+struct Friend: Codable, Identifiable {
+    var id = UUID()
+    var name: String
+    var artists: [String]
+}
+
+struct TastePayload: Codable {
+    var v: Int
+    var n: String
+    var a: [String]
+}
+
 func fmt(_ s: Double) -> String {
     guard s.isFinite, s > 0 else { return "0:00" }
     let i = Int(s)

@@ -40,6 +40,20 @@ enum Sources {
         }
     }
 
+    /// Быстрый поиск по открытым источникам без Archive и Funkwhale
+    static func quick(_ q: String, key: String) async -> [Track] {
+        var out: [Track] = []
+        await withTaskGroup(of: (String, [Track], String?).self) { g in
+            if !key.isEmpty {
+                g.addTask { await Sources.run("Jamendo") { try await Sources.jamendo(q, key: key) } }
+            }
+            g.addTask { await Sources.run("Audius") { try await Sources.audius(q) } }
+            g.addTask { await Sources.run("ccMixter") { try await Sources.ccmixter(q) } }
+            for await r in g { out += r.1 }
+        }
+        return out
+    }
+
     // MARK: Jamendo
     static func jamendo(_ q: String, key: String) async throws -> [Track] {
         let j = try await json("https://api.jamendo.com/v3.0/tracks/?format=json&limit=25&audioformat=mp32&imagesize=600&client_id=\(enc(key))&search=\(enc(q))")
