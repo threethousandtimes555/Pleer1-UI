@@ -98,15 +98,15 @@ struct ArtView: View {
     @State private var img: UIImage? = nil
 
     var body: some View {
-        ZStack {
-            Color.gray.opacity(0.18)
-            if let i = img {
-                Image(uiImage: i).resizable().scaledToFill()
-            } else {
-                Image(systemName: "music.note").foregroundColor(.secondary)
+        Color.gray.opacity(0.18)
+            .overlay {
+                if let i = img {
+                    Image(uiImage: i).resizable().scaledToFill()
+                } else {
+                    Image(systemName: "music.note").foregroundColor(.secondary)
+                }
             }
-        }
-        .clipped()
+            .clipped()
         .task(id: track?.id ?? "") {
             img = await loadImage()
         }
@@ -127,6 +127,6 @@ struct Cover: View {
     var body: some View {
         ArtView(track: track)
             .frame(width: size, height: size)
-            .clipShape(RoundedRectangle(cornerRadius: size * 0.22))
+            .clipShape(RoundedRectangle(cornerRadius: size * AppTheme.current.palette.corner))
     }
 }
