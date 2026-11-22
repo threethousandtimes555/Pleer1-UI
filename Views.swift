@@ -13,8 +13,6 @@ struct RootView: View {
                 .tabItem { Label("Поиск", systemImage: "magnifyingglass") }
             LibraryView(showPlayer: $showPlayer)
                 .tabItem { Label("Моё", systemImage: "heart") }
-            FriendsView(showPlayer: $showPlayer)
-                .tabItem { Label("Друзья", systemImage: "person.2") }
             SettingsView(showPlayer: $showPlayer)
                 .tabItem { Label("Настройки", systemImage: "slider.horizontal.3") }
         }
@@ -92,7 +90,7 @@ struct TrackRow: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(track.title).lineLimit(2)
                         Text(track.artist + (track.tag.isEmpty ? "" : " · " + track.tag))
-                            .font(AppTheme.current == .concrete ? Font.system(.footnote, design: .monospaced) : Font.footnote)
+                            .font(AppTheme.current == .soft ? Font.system(.footnote, design: .rounded) : Font.footnote)
                             .foregroundColor(.secondary)
                             .lineLimit(1)
                     }
@@ -173,9 +171,31 @@ struct SearchView: View {
         return filter.isEmpty ? model.results : model.results.filter { $0.tag == filter }
     }
 
+    private func startWave() {
+        let a = store.myArtists().shuffled()
+        if a.isEmpty {
+            store.say("Пока мало данных: добавь треки в избранное или файлы")
+            return
+        }
+        store.say("Подбираю волну…")
+        Task {
+            let t = await Recommender.wave(artists: a, key: store.jamendoKey)
+            if t.isEmpty {
+                store.say("Ничего не нашлось в открытых источниках")
+            } else {
+                player.play(t, at: 0)
+            }
+        }
+    }
+
     var body: some View {
         NavigationStack {
             List {
+                Section {
+                    Button { startWave() } label: {
+                        Label("Моя волна", systemImage: "waveform")
+                    }
+                }
                 if !model.errors.isEmpty {
                     Section {
                         ForEach(model.errors, id: \.self) { e in
@@ -360,7 +380,7 @@ struct PlaylistView: View {
 }
 
 struct SettingsView: View {
-    @AppStorage("theme") private var themeRaw = "dark"
+    @AppStorage("theme") private var themeRaw = "soft"
     @EnvironmentObject var store: Store
     @EnvironmentObject var player: Player
     @Binding var showPlayer: Bool
@@ -370,7 +390,7 @@ struct SettingsView: View {
             Form {
                 Section("Тема") {
                     Picker("Оформление", selection: Binding(get: { themeRaw }, set: { v in
-                        (AppTheme(rawValue: v) ?? .dark).applyAppearance()
+                        (AppTheme(rawValue: v) ?? .soft).applyAppearance()
                         themeRaw = v
                     })) {
                         ForEach(AppTheme.allCases, id: \.rawValue) { t in
@@ -436,8 +456,8 @@ struct PlayerBackdrop: View {
     let track: Track?
 
     var body: some View {
-        let light = AppTheme.current == .concrete
-        Color(red: light ? 0.93 : 0, green: light ? 0.93 : 0, blue: light ? 0.92 : 0)
+        let light = AppTheme.current == .soft
+        Color(red: light ? 0.957 : 0, green: light ? 0.953 : 0, blue: light ? 0.937 : 0)
             .overlay {
                 ZStack {
                     ArtView(track: track)
@@ -467,18 +487,16 @@ struct PlayerView: View {
                         Spacer(minLength: 6)
                         ArtView(track: t)
                             .frame(width: side, height: side)
-                            .clipShape(RoundedRectangle(cornerRadius: AppTheme.current == .concrete ? 0 : 26))
-                            .overlay(Rectangle().stroke(Color(red: 0.05, green: 0.05, blue: 0.05), lineWidth: AppTheme.current == .concrete ? 1 : 0))
-                            .shadow(color: Color.black.opacity(AppTheme.current == .concrete ? 0 : 0.4), radius: 20, x: 0, y: 10)
+                            .clipShape(RoundedRectangle(cornerRadius: 28))
+                            .shadow(color: Color.black.opacity(AppTheme.current == .soft ? 0.18 : 0.4), radius: 20, x: 0, y: 10)
                         Spacer(minLength: 4)
                         HStack {
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(t.title)
-                                    .font(AppTheme.current == .concrete ? Font.system(size: 26, weight: .black) : Font.title3.weight(.semibold))
+                                    .font(AppTheme.current == .soft ? Font.system(size: 26, weight: .bold, design: .rounded) : Font.title3.weight(.semibold))
                                     .lineLimit(2)
                                 Text(t.artist)
-                                    .font(AppTheme.current == .concrete ? Font.system(.footnote, design: .monospaced) : Font.body)
-                                    .textCase(AppTheme.current == .concrete ? .uppercase : nil)
+                                    .font(Font.body)
                                     .foregroundColor(.secondary)
                                     .lineLimit(1)
                             }
@@ -506,7 +524,7 @@ struct PlayerView: View {
                         }
                         .font(.title2)
                         .foregroundColor(.primary)
-                        HStack(spacing: 38) {
+                        HStack(spacing: 30) {
                             Menu {
                                 ForEach(store.playlists) { p in
                                     Button(p.name) { store.add(t, to: p.id) }
@@ -533,6 +551,26 @@ struct PlayerView: View {
                                 }
                             } label: {
                                 Image(systemName: "speedometer").foregroundColor(player.speed != 1.0 ? accent : .secondary)
+                            }
+                            Menu {
+                                Picker("Эквалайзер", selection: Binding(get: { player.eqPreset }, set: { player.setEQ($0) })) {
+                                    ForEach(EQPreset.allCases, id: \.self) { p in
+                                        Text(p.title).tag(p)
+                                    }
+                                }
+                            } label: {
+                                Image(systemName: "slider.vertical.3").foregroundColor(player.eqPreset != .off ? accent : .secondary)
+                            }
+                            Menu {
+                                Picker("Наслоение", selection: Binding(get: { player.crossfade }, set: { player.setCrossfade($0) })) {
+                                    Text("Выкл").tag(0)
+                                    Text("3 секунды").tag(3)
+                                    Text("6 секунд").tag(6)
+                                    Text("9 секунд").tag(9)
+                                    Text("12 секунд").tag(12)
+                                }
+                            } label: {
+                                Image(systemName: "rectangle.on.rectangle").foregroundColor(player.crossfade > 0 ? accent : .secondary)
                             }
                         }
                         .font(.title3)
